@@ -3,8 +3,10 @@ from functools import partial
 import timm
 from transformers import AutoModel, RobertaModel
 
+##############################
 from models.losses import CLIP_Loss, CyCLIP_Loss, SogCLR_Loss, VICReg_Loss
-from models.losses import iSogCLR_New_v2_Loss, iSogCLR_New_v1_Loss, onlineCLR_Loss, iSogCLR_New_Loss
+from models.losses import iSogCLR_New_v2_Loss, iSogCLR_New_v1_Loss, onlineCLR_Loss, iSogCLR_New_Loss, SwAV_CLIP_Loss
+###############################
 
 import torch
 from torch import nn
@@ -74,6 +76,19 @@ class CLIP(nn.Module):
                 self.criterion = CLIP_Loss(world_size=world_size, personalized_tau=personalized_tau, temperature=self.temp)
             else:
                 self.criterion = CLIP_Loss(world_size=world_size, personalized_tau=personalized_tau, image_tau=self.image_temp, text_tau=self.text_temp)
+
+        ################################
+        elif self.ita_type == 'swav_clip':
+            # Build SwAV+CLIP loss. Pass personalized temp arrays if used.
+            if not personalized_tau:
+                self.criterion = SwAV_CLIP_Loss(world_size=world_size, temperature=self.temp,
+                                                personalized_tau=False, image_tau=None, text_tau=None,
+                                                num_prototypes=300, tau_p=0.1, lambda_swav=0.2, use_sinkhorn=True)
+            else:
+                self.criterion = SwAV_CLIP_Loss(world_size=world_size, temperature=self.temp,
+                                                personalized_tau=True, image_tau=self.image_temp, text_tau=self.text_temp,
+                                                num_prototypes=300, tau_p=0.1, lambda_swav=0.2, use_sinkhorn=True)
+        ###############################
 
         elif self.ita_type == 'cyclip':
             self.criterion = CyCLIP_Loss(world_size=world_size, temperature=self.temp)
@@ -150,6 +165,27 @@ class CLIP(nn.Module):
                     avg_tau = self.temp
                 info_dict['avg_image_tau'] = avg_tau
                 info_dict['avg_text_tau'] = avg_tau
+
+        #############################
+        elif self.ita_type == 'swav_clip':
+            if self.personalized_tau:
+                if self.distributed:
+                    image_ids = concat_all_gather(idx)
+                    text_ids = concat_all_gather(text_idx)
+                else:
+                    image_ids, text_ids = idx, text_idx
+                loss_ita = self.criterion(image_feat, text_feat, image_ids, text_ids)
+                info_dict['avg_image_tau'] = self.criterion.image_tau[image_ids].mean()
+                info_dict['avg_text_tau'] = self.criterion.text_tau[text_ids].mean()
+            else:
+                loss_ita = self.criterion(image_feat, text_feat)
+                if not self.learnable_temp:
+                    avg_tau = torch.tensor(self.temp)
+                else:
+                    avg_tau = self.temp
+                info_dict['avg_image_tau'] = avg_tau
+                info_dict['avg_text_tau'] = avg_tau
+        ########################################
 
         elif self.ita_type == 'vicreg':
             loss_ita = self.criterion(image_embeds, text_embeds)
