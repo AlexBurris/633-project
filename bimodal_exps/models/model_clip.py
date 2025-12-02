@@ -83,7 +83,7 @@ class CLIP(nn.Module):
                 self.criterion = CLIP_Loss(world_size=world_size, personalized_tau=personalized_tau, image_tau=self.image_temp, text_tau=self.text_temp)
 
         ################################
-       elif self.ita_type == 'swav_clip':
+        elif self.ita_type == 'swav_clip':
             # Combined CLIP + SwAV loss (safe, no in-place ops in forward)
             self.criterion = SwAV_CLIP_Loss(
                 world_size=world_size,
