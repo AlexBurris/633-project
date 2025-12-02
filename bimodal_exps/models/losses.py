@@ -52,6 +52,7 @@ class SwAV_CLIP_Loss(nn.Module):
         personalized_tau=False,
         image_tau=None,
         text_tau=None,
+        
         num_prototypes=300,
         tau_p=0.1,
         lambda_swav=0.4,
@@ -178,15 +179,18 @@ class SogCLR_SwAV_Loss(nn.Module):
     def __init__(
         self,
         N=2900000,
+        
         gamma=0.1,
         temperature=0.07,
         world_size=8,
         bsz=128,
+        
         num_prototypes=300,
-        tau_p=0.1,
-        lambda_swav=0.2,
+        tau_p=0.14,
+        lambda_swav=0.4,
         use_sinkhorn=True,
         sinkhorn_iters=3,
+        
         enable_surrogate=False,
         surrogate_c=1.0,
     ):
