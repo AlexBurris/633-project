@@ -125,13 +125,10 @@ class CLIP(nn.Module):
                 bsz=bsz,
                 
                 num_prototypes=num_prototypes,
-                tau_p=self.temp*10,
+                tau_p=self.temp*2,
                 lambda_swav=lambda_swav,
                 use_sinkhorn=True,
                 sinkhorn_iters=3
-            
-                enable_surrogate=False,
-                surrogate_c=1.0,
             )
         ########################
                      
