@@ -42,117 +42,131 @@ class GatherLayer(torch.autograd.Function):
 ##################################################
 class SwAV_CLIP_Loss(nn.Module):
     """
-    Combined CLIP InfoNCE + SwAV cross-modal clustering.
-    Signature matches CLIP_Loss: forward(image_features, text_features, image_idx=None, text_idx=None)
+    Combined CLIP InfoNCE + SwAV cross-modal loss.
+    Fully safe: no in-place ops on parameters or gradient-carrying tensors.
     """
-
-    def __init__(self, world_size=1, temperature=0.01, personalized_tau=False, image_tau=None, text_tau=None,
-                 num_prototypes=300, tau_p=0.1, lambda_swav=0.2, use_sinkhorn=True, sinkhorn_iters=3):
+    def __init__(
+        self, 
+        world_size=1,
+        temperature=0.01,
+        personalized_tau=False,
+        image_tau=None,
+        text_tau=None,
+        num_prototypes=300,
+        tau_p=0.1,
+        lambda_swav=0.4,
+        use_sinkhorn=True,
+        sinkhorn_iters=3,
+    ):
         super().__init__()
-        # CLIP params
+
+        # CLIP
         self.world_size = world_size
         self.temperature = temperature
         self.personalized_tau = personalized_tau
         self.image_tau = image_tau
         self.text_tau = text_tau
 
-        # SwAV params
+        # SwAV
         self.num_prototypes = num_prototypes
         self.tau_p = tau_p
         self.lambda_swav = lambda_swav
         self.use_sinkhorn = use_sinkhorn
         self.sinkhorn_iters = sinkhorn_iters
 
-        # prototypes parameter will be lazily created when we get embedding dim
+        # init later when dim known
         self.prototypes = None
 
-    def _init_prototypes(self, embedding_dim, device):
-        """Lazy init prototypes as nn.Parameter so they are included in model.parameters()."""
-        self.prototypes = nn.Parameter(torch.randn(self.num_prototypes, embedding_dim, device=device))
-        with torch.no_grad():
-            self.prototypes[:] = F.normalize(self.prototypes, dim=1)
+    def _init_prototypes(self, dim, device):
+        p = torch.randn(self.num_prototypes, dim, device=device)
+        p = F.normalize(p, dim=1)
+        self.prototypes = nn.Parameter(p)
+
+    def _safe_exp(self, x):
+        # avoid views that share underlying storage
+        z = torch.exp(x).clamp(min=1e-8)
+        return z.clone()
 
     def _sinkhorn(self, Q):
-        """Sinkhorn-Knopp (no grad). Q is non-negative (e.g. exp(logits/tau_p))."""
+        # expects Q already cloned
         with torch.no_grad():
             Q = Q / (Q.sum() + 1e-12)
             B, K = Q.shape
+
             for _ in range(self.sinkhorn_iters):
-                Q /= (Q.sum(dim=1, keepdim=True) + 1e-12)
-                Q /= (Q.sum(dim=0, keepdim=True) + 1e-12)
-            Q /= (Q.sum(dim=1, keepdim=True) + 1e-12)
+                Q = Q / (Q.sum(dim=1, keepdim=True) + 1e-12)
+                Q = Q / (Q.sum(dim=0, keepdim=True) + 1e-12)
+
+            Q = Q / (Q.sum(dim=1, keepdim=True) + 1e-12)
         return Q
 
     def forward(self, image_features, text_features, image_idx=None, text_idx=None):
-        """
-        image_features: (B, D)
-        text_features:  (B, D)
-        returns: scalar combined loss
-        """
-        # Gather across GPUs if necessary (same behavior as CLIP_Loss)
+        # Distributed gather (matches CLIP_Loss behavior)
         if self.world_size > 1:
             image_features = torch.cat(GatherLayer.apply(image_features), dim=0)
             text_features = torch.cat(GatherLayer.apply(text_features), dim=0)
 
         device = image_features.device
 
-        # lazy init prototypes when embedding dim is known
+        # lazy init prototypes
         if self.prototypes is None:
             self._init_prototypes(image_features.size(1), device)
 
-        # Normalized features
         img = F.normalize(image_features, dim=1)
         txt = F.normalize(text_features, dim=1)
 
-        # ===== CLIP InfoNCE (exactly like CLIP_Loss) =====
+        # -----------------------------------------
+        # CLIP LOSS (same logic as original class)
+        # -----------------------------------------
         if self.personalized_tau:
-            # per-sample temperature arrays expected to be provided (image_tau/text_tau)
-            assert (self.image_tau is not None) and (self.text_tau is not None), "personalized taus missing"
             image_temp = self.image_tau[image_idx]
-            text_temp = self.text_tau[text_idx]
-            sim = torch.einsum('i d, j d -> i j', txt, img)
-            labels = torch.arange(img.shape[0], device=img.device)
-            clip_loss = (F.cross_entropy(sim / text_temp, labels) + F.cross_entropy(sim.t() / image_temp, labels)) / 2.0
+            text_temp  = self.text_tau[text_idx]
+
+            sim = torch.einsum("id,jd->ij", txt, img)
+            labels = torch.arange(img.size(0), device=device)
+
+            loss_clip = (
+                F.cross_entropy(sim / text_temp, labels) +
+                F.cross_entropy(sim.t() / image_temp, labels)
+            ) / 2.0
         else:
-            sim = torch.einsum('i d, j d -> i j', txt, img) / self.temperature
-            labels = torch.arange(img.shape[0], device=img.device)
-            clip_loss = (F.cross_entropy(sim, labels) + F.cross_entropy(sim.t(), labels)) / 2.0
+            sim = torch.einsum("id,jd->ij", txt, img) / self.temperature
+            labels = torch.arange(img.size(0), device=device)
 
-        # ===== SwAV prototype logits (cross-modal) =====
-        P = F.normalize(self.prototypes, dim=1)  # (K, D) normalized
-        logits_img = img @ P.t()   # (B, K)
-        logits_txt = txt @ P.t()   # (B, K)
+            loss_clip = (
+                F.cross_entropy(sim, labels) +
+                F.cross_entropy(sim.t(), labels)
+            ) / 2.0
 
-        # ===== compute targets q (no grad when using sinkhorn) =====
+        # -----------------------------------------
+        # SwAV LOSS
+        # -----------------------------------------
+        P = F.normalize(self.prototypes, dim=1)   # SAFE (not in-place)
+
+        logits_img = img @ P.t()
+        logits_txt = txt @ P.t()
+
         if self.use_sinkhorn:
+            Q_img = self._safe_exp(logits_img / self.tau_p)
+            Q_txt = self._safe_exp(logits_txt / self.tau_p)
+
             with torch.no_grad():
-                Q_img = torch.exp(logits_img / self.tau_p).clamp(min=1e-8)
-                Q_txt = torch.exp(logits_txt / self.tau_p).clamp(min=1e-8)
                 q_img = self._sinkhorn(Q_img)
                 q_txt = self._sinkhorn(Q_txt)
         else:
-            q_img = F.softmax(logits_img / self.tau_p, dim=1)
-            q_txt = F.softmax(logits_txt / self.tau_p, dim=1)
+            q_img = F.softmax(logits_img / self.tau_p, dim=1).detach()
+            q_txt = F.softmax(logits_txt / self.tau_p, dim=1).detach()
 
-        # ===== predictions p (have grad) =====
         p_img = F.log_softmax(logits_img / self.tau_p, dim=1)
         p_txt = F.log_softmax(logits_txt / self.tau_p, dim=1)
 
-        # swapped cross-modal loss (mean over batch)
-        loss_img2txt = torch.mean(torch.sum(- q_txt * p_img, dim=1))
-        loss_txt2img = torch.mean(torch.sum(- q_img * p_txt, dim=1))
-        swav_loss = 0.5 * (loss_img2txt + loss_txt2img)
+        loss_img2txt = torch.mean(torch.sum(-q_txt * p_img, dim=1))
+        loss_txt2img = torch.mean(torch.sum(-q_img * p_txt, dim=1))
+        loss_swav = 0.5 * (loss_img2txt + loss_txt2img)
 
-        # renormalize prototypes in-place (stability)
-        with torch.no_grad():
-            self.prototypes[:] = F.normalize(self.prototypes, dim=1)
+        return loss_clip + self.lambda_swav * loss_swav
 
-        # combined scalar
-        total_loss = clip_loss + self.lambda_swav * swav_loss
-
-        return total_loss
 ###############################################################################
-
 
 
 
