@@ -168,7 +168,180 @@ class SwAV_CLIP_Loss(nn.Module):
 
 ###############################################################################
 
+###############################################################################
+class SogCLR_SwAV_Loss(nn.Module):
+    """
+    Combined SogCLR (dynamic negative weighting) + SwAV (prototype clustering).
+    Matches EXACT forward signature required by CLIP model:
+        (loss, avg_image_tau, avg_text_tau)
+    """
+    def __init__(
+        self,
+        N=2900000,
+        gamma=0.1,
+        temperature=0.07,
+        world_size=8,
+        bsz=128,
+        num_prototypes=300,
+        tau_p=0.1,
+        lambda_swav=0.2,
+        use_sinkhorn=True,
+        sinkhorn_iters=3,
+        enable_surrogate=False,
+        surrogate_c=1.0,
+    ):
+        super().__init__()
 
+        # SogCLR params
+        self.world_size = world_size
+        self.gamma = gamma
+        self.temperature = temperature
+        self.eps = 1e-8
+        self.bsz = bsz
+
+        # per-sample memory (same as original SogCLR)
+        self.s_I = torch.zeros(N).cuda()
+        self.s_T = torch.zeros(N).cuda()
+        self.b_I = torch.zeros(N).cuda()
+        self.b_T = torch.zeros(N).cuda()
+
+        self.enable_surrogate = enable_surrogate
+        self.c = surrogate_c
+        self.mask_neg = (1.0 - torch.eye(bsz)).cuda()
+
+        # SwAV params
+        self.num_prototypes = num_prototypes
+        self.tau_p = tau_p
+        self.lambda_swav = lambda_swav
+        self.use_sinkhorn = use_sinkhorn
+        self.sinkhorn_iters = sinkhorn_iters
+
+        # prototypes (init lazily)
+        self.prototypes = None
+
+    def _init_prototypes(self, dim, device):
+        P = torch.randn(self.num_prototypes, dim, device=device)
+        P = F.normalize(P, dim=1)
+        self.prototypes = nn.Parameter(P)
+
+    def _sqh(self, x):
+        return torch.maximum(torch.zeros_like(x), x + self.c) ** 2
+
+    def _safe_exp(self, x):
+        z = torch.exp(x).clamp(min=1e-8)
+        return z.clone()
+
+    def _sinkhorn(self, Q):
+        with torch.no_grad():
+            Q = Q / (Q.sum() + 1e-12)
+            for _ in range(self.sinkhorn_iters):
+                Q = Q / (Q.sum(dim=1, keepdim=True) + 1e-12)
+                Q = Q / (Q.sum(dim=0, keepdim=True) + 1e-12)
+            Q = Q / (Q.sum(dim=1, keepdim=True) + 1e-12)
+        return Q
+
+
+    def forward(self, image_features, text_features, image_ids, text_ids, epoch):
+        # Multi-GPU gather
+        if self.world_size > 1:
+            image_features = torch.cat(GatherLayer.apply(image_features), dim=0)
+            text_features = torch.cat(GatherLayer.apply(text_features), dim=0)
+
+        device = image_features.device
+
+        # Initialize prototypes lazily
+        if self.prototypes is None:
+            self._init_prototypes(image_features.size(1), device)
+
+        # ------------------------------------------------
+        # 1. SOGCLR PART  (unchanged from original logic)
+        # ------------------------------------------------
+        sim = torch.einsum("id,jd->ij", image_features, text_features)
+        diag_sim = torch.diagonal(sim)
+        bsz = sim.size(0)
+
+        image_diffs = sim - diag_sim[:, None]
+        text_diffs  = sim - diag_sim[None, :]
+
+        if self.enable_surrogate:
+            image_diffs = self._sqh(image_diffs)
+            text_diffs  = self._sqh(text_diffs)
+
+        img_d = (image_diffs / self.temperature).clone().detach()
+        txt_d = (text_diffs  / self.temperature).clone().detach()
+
+        # Update b_I
+        old_bI = self.b_I[image_ids]
+        new_bI = torch.max(img_d, old_bI[:, None].repeat(1, bsz))
+        self.b_I[image_ids] = torch.max(new_bI, dim=1)[0]
+
+        # Update b_T
+        old_bT = self.b_T[text_ids]
+        new_bT = torch.max(txt_d, old_bT[None, :].repeat(bsz, 1))
+        self.b_T[text_ids] = torch.max(new_bT, dim=0)[0]
+
+        exp_img = torch.exp(img_d - self.b_I[image_ids][:, None]) * self.mask_neg
+        exp_txt = torch.exp(txt_d - self.b_T[text_ids][None, :]) * self.mask_neg
+
+        g_I = torch.sum(exp_img, dim=1, keepdim=True) / (bsz - 1)
+        g_T = torch.sum(exp_txt, dim=0, keepdim=True) / (bsz - 1)
+
+        if epoch == 0:
+            s_I = g_I
+            s_T = g_T
+        else:
+            s_I = (1 - self.gamma) * self.s_I[image_ids] * torch.exp(old_bI - self.b_I[image_ids]) + self.gamma * g_I.squeeze()
+            s_T = (1 - self.gamma) * self.s_T[text_ids] * torch.exp(old_bT - self.b_T[text_ids]) + self.gamma * g_T.squeeze()
+            s_I = s_I.reshape(g_I.shape)
+            s_T = s_T.reshape(g_T.shape)
+
+        self.s_I[image_ids] = s_I.squeeze()
+        self.s_T[text_ids] = s_T.squeeze()
+
+        weights_img = exp_img / (s_I + self.eps)
+        weights_txt = exp_txt / (s_T + self.eps)
+
+        sogclr_loss = (
+            torch.sum(weights_img * image_diffs, dim=1).mean() / (bsz - 1) +
+            torch.sum(weights_txt * text_diffs, dim=0).mean() / (bsz - 1)
+        )
+
+        # ------------------------------------------------
+        # 2. SWAV PART  
+        # ------------------------------------------------
+        P = F.normalize(self.prototypes, dim=1)
+
+        logits_img = image_features @ P.t()
+        logits_txt = text_features @ P.t()
+
+        if self.use_sinkhorn:
+            Q_img = self._safe_exp(logits_img / self.tau_p)
+            Q_txt = self._safe_exp(logits_txt / self.tau_p)
+
+            with torch.no_grad():
+                q_img = self._sinkhorn(Q_img)
+                q_txt = self._sinkhorn(Q_txt)
+        else:
+            q_img = F.softmax(logits_img / self.tau_p, dim=1).detach()
+            q_txt = F.softmax(logits_txt / self.tau_p, dim=1).detach()
+
+        p_img = F.log_softmax(logits_img / self.tau_p, dim=1)
+        p_txt = F.log_softmax(logits_txt / self.tau_p, dim=1)
+
+        swav_loss = 0.5 * (
+            torch.mean(torch.sum(-q_txt * p_img, dim=1)) +
+            torch.mean(torch.sum(-q_img * p_txt, dim=1))
+        )
+
+        # Final combined loss
+        loss = sogclr_loss + self.lambda_swav * swav_loss
+
+        # Return SAME format as SogCLR:
+        avg_image_tau = 0.0
+        avg_text_tau  = 0.0
+
+        return loss, avg_image_tau, avg_text_tau
+#####################################################################
 
 
 
