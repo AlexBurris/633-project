@@ -5,7 +5,7 @@ from transformers import AutoModel, RobertaModel
 
 ##############################
 from models.losses import CLIP_Loss, CyCLIP_Loss, SogCLR_Loss, VICReg_Loss
-from models.losses import iSogCLR_New_v2_Loss, iSogCLR_New_v1_Loss, onlineCLR_Loss, iSogCLR_New_Loss, SwAV_CLIP_Loss
+from models.losses import iSogCLR_New_v2_Loss, iSogCLR_New_v1_Loss, onlineCLR_Loss, iSogCLR_New_Loss, SwAV_CLIP_Loss, SogCLR_SwAV_Loss
 ###############################
 
 import torch
@@ -108,6 +108,32 @@ class CLIP(nn.Module):
         # elif self.ita_type == 'sogclr_dro':
         #     self.criterion = SogCLR_DRO_Loss(world_size=world_size, gamma=sogclr_gamma, rho_init=rho_init, tau_init=tau_init, bsz=bsz,
         #                                      eta_init=eta_init, beta_u=beta_u, enable_surrogate=enable_surrogate)
+
+
+        #########################
+        elif self.ita_type == 'sogclr_swav':
+            self.criterion = SogCLR_SwAV_Loss(
+                world_size=world_size,
+                gamma=sogclr_gamma,
+                temperature=self.temp,
+                bsz=bsz,
+                num_prototypes=300,
+                tau_p=0.1,
+                lambda_swav=0.2,
+                use_sinkhorn=True,
+                sinkhorn_iters=3
+
+                num_prototypes=300,
+                tau_p=0.1,
+                lambda_swav=0.2,
+                use_sinkhorn=True,
+                sinkhorn_iters=3,
+            
+                enable_surrogate=False,
+                surrogate_c=1.0,
+            )
+        ########################
+                     
         elif self.ita_type == 'isogclr_new_v2':
             self.criterion = iSogCLR_New_v2_Loss(world_size=world_size, gamma=sogclr_gamma, rho_init=rho_init, tau_init=tau_init, bsz=bsz,
                                                  eta_init=eta_init, beta_u=beta_u)
@@ -208,7 +234,20 @@ class CLIP(nn.Module):
             info_dict['lamda'] = 0.0
 
         #########################
-
+        elif self.ita_type == 'sogclr_swav':
+            if self.distributed:
+                image_ids = concat_all_gather(idx)
+                text_ids = concat_all_gather(text_idx)
+            else:
+                image_ids, text_ids = idx, text_idx
+            loss_ita, avg_image_tau, avg_text_tau = self.criterion(image_feat, text_feat, image_ids, text_ids, epoch)
+            if not self.learnable_temp:
+                avg_tau = torch.tensor(self.temp)
+            else:
+                avg_tau = self.temp
+            info_dict['avg_text_tau'] = avg_text_tau
+            info_dict['avg_image_tau'] = avg_image_tau
+            info_dict['lamda'] = 0.0
         #########################
 
         elif self.ita_type in ['sogclr_dro', 'isogclr_new']:
