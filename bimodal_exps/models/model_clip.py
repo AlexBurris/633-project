@@ -38,6 +38,10 @@ class CLIP(nn.Module):
                  use_temp_net = True,
                  alpha = 1.0,
                  distributed=True,
+                 alpha = 1.0,
+                 distributed=True,
+                 num_prototypes=300, 
+                 lambda_swav=0.4
                  ):
         super().__init__()
 
@@ -175,9 +179,9 @@ class CLIP(nn.Module):
                 personalized_tau=personalized_tau,
                 image_tau=self.image_temp if personalized_tau else None,
                 text_tau=self.text_temp if personalized_tau else None,
-                num_prototypes=300,
+                num_prototypes=num_prototypes,
                 tau_p=self.temp*10,
-                lambda_swav=0.4,
+                lambda_swav=lambda_swav,
                 use_sinkhorn=True,
                 sinkhorn_iters=3
             )
@@ -202,6 +206,10 @@ class CLIP(nn.Module):
             info_dict['avg_text_tau'] = avg_text_tau
             info_dict['avg_image_tau'] = avg_image_tau
             info_dict['lamda'] = 0.0
+
+        #########################
+
+        #########################
 
         elif self.ita_type in ['sogclr_dro', 'isogclr_new']:
             if self.distributed:
