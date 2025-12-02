@@ -674,8 +674,8 @@ if __name__ == '__main__':
     parser.add_argument('--alpha', default=1.0, type=float, help='for isogclr_denoise')
 
     # swav
-    parser.add_argument('--lambda_swav', default=0.4, type=float, help='for isogclr_denoise')
-    parser.add_argument('--num_prototypes', default=300, type=int, help='for isogclr_denoise')
+    parser.add_argument('--lambda_swav', default=0.4, type=float)
+    parser.add_argument('--num_prototypes', default=300, type=int)
 
     # set the fraction of data used for training
     parser.add_argument('--train_frac', default=1.0, type=float)
