@@ -38,8 +38,6 @@ class CLIP(nn.Module):
                  use_temp_net = True,
                  alpha = 1.0,
                  distributed=True,
-                 alpha = 1.0,
-                 distributed=True,
                  
                  num_prototypes=300, 
                  lambda_swav=0.4
