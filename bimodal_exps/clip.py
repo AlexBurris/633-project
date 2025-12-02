@@ -436,7 +436,8 @@ def main(args):
                   world_size=args.world_size, ita_type=args.ita_type, sogclr_gamma=args.sogclr_gamma, rho_I=args.rho_I, rho_T=args.rho_T, tau_init=args.tau_init,
                   eta_init=args.eta_init, beta_u=args.beta_u, temp=args.temp, learnable_temp=args.learnable_temp,
                   vicreg_sim_coeff=args.vicreg_sim_coeff, vicreg_std_coeff=args.vicreg_std_coeff, personalized_tau=args.personalized_tau, 
-                  use_temp_net=args.isogclr_temp_net, alpha=args.alpha, distributed=args.distributed)
+                  use_temp_net=args.isogclr_temp_net, alpha=args.alpha, distributed=args.distributed,
+                  num_prototypes=args.num_prototypes, lambda_swav=args.lambda_swav)
     model = model.to(device)
 
     if args.evaluate or args.ita_type == 'isogclr_denoise':
@@ -655,7 +656,7 @@ if __name__ == '__main__':
 
     # loss config
     parser.add_argument('--ita_type', required=True, choices=['clip', 'cyclip', 'vicreg', 'sogclr', 'sogclr_dro', 
-                        'isogclr_new_v2', 'isogclr_new_v1', 'isogclr_new', 'onlineclr', 'swav_clip'])
+                        'isogclr_new_v2', 'isogclr_new_v1', 'isogclr_new', 'onlineclr', 'swav_clip', 'swav_sogclr'])
     parser.add_argument('--vicreg_sim_coeff', default=25.0, type=float)
     parser.add_argument('--vicreg_std_coeff', default=25.0, type=float)
     parser.add_argument('--sogclr_gamma', default=0.8, type=float)
@@ -671,6 +672,10 @@ if __name__ == '__main__':
     parser.add_argument('--store_tau', action='store_true')
     parser.add_argument('--isogclr_temp_net', action='store_true')
     parser.add_argument('--alpha', default=1.0, type=float, help='for isogclr_denoise')
+
+    # swav
+    parser.add_argument('--lambda_swav', default=0.4, type=float, help='for isogclr_denoise')
+    parser.add_argument('--num_prototypes', default=300, type=int, help='for isogclr_denoise')
 
     # set the fraction of data used for training
     parser.add_argument('--train_frac', default=1.0, type=float)
