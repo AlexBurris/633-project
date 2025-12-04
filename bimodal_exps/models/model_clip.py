@@ -82,7 +82,6 @@ class CLIP(nn.Module):
 
         ################################
         elif self.ita_type == 'swav_clip':
-            # Combined CLIP + SwAV loss (safe, no in-place ops in forward)
             self.criterion = SwAV_CLIP_Loss(
                 world_size=world_size,
                 temperature=self.temp,
@@ -91,7 +90,7 @@ class CLIP(nn.Module):
                 text_tau=self.text_temp if personalized_tau else None,
                 
                 num_prototypes=num_prototypes,
-                tau_p=self.temp*10,
+                tau_p=self.temp*10,#good for defualt temp
                 lambda_swav=lambda_swav,
                 use_sinkhorn=True,
                 sinkhorn_iters=3
