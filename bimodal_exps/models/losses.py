@@ -112,26 +112,27 @@ class SwAV_CLIP_Loss(nn.Module):
 
 
         # CLIP LOSS
-        if self.personalized_tau:
-            image_temp = self.image_tau[image_idx]
-            text_temp  = self.text_tau[text_idx]
-
-            sim = torch.einsum("id,jd->ij", txt, img)
-            labels = torch.arange(img.size(0), device=device)
-
-            loss_clip = (
-                F.cross_entropy(sim / text_temp, labels) +
-                F.cross_entropy(sim.t() / image_temp, labels)
-            ) / 2.0
-        else:
-            sim = torch.einsum("id,jd->ij", txt, img) / self.temperature
-            labels = torch.arange(img.size(0), device=device)
-
-            loss_clip = (
-                F.cross_entropy(sim, labels) +
-                F.cross_entropy(sim.t(), labels)
-            ) / 2.0
-
+        if (self.lambda_swav!=-1):
+            if self.personalized_tau:
+                image_temp = self.image_tau[image_idx]
+                text_temp  = self.text_tau[text_idx]
+    
+                sim = torch.einsum("id,jd->ij", txt, img)
+                labels = torch.arange(img.size(0), device=device)
+    
+                loss_clip = (
+                    F.cross_entropy(sim / text_temp, labels) +
+                    F.cross_entropy(sim.t() / image_temp, labels)
+                ) / 2.0
+            else:
+                sim = torch.einsum("id,jd->ij", txt, img) / self.temperature
+                labels = torch.arange(img.size(0), device=device)
+    
+                loss_clip = (
+                    F.cross_entropy(sim, labels) +
+                    F.cross_entropy(sim.t(), labels)
+                ) / 2.0
+                
         # SWAV LOSS
         P = F.normalize(self.prototypes, dim=1) # re-normalize
 
@@ -156,8 +157,12 @@ class SwAV_CLIP_Loss(nn.Module):
             torch.mean(torch.sum(-q_txt * p_img, dim=1)) +
             torch.mean(torch.sum(-q_img * p_txt, dim=1))
         )
-        
-        return loss_clip + self.lambda_swav * swav_loss
+
+
+        if (self.lambda_swav!=-1):
+            return loss_clip + self.lambda_swav * swav_loss
+        else:
+            return swav_loss
 
 ###############################################################################
 
