@@ -41,10 +41,6 @@ class GatherLayer(torch.autograd.Function):
 
 ##################################################
 class SwAV_CLIP_Loss(nn.Module):
-    """
-    Combined CLIP InfoNCE + SwAV cross-modal loss.
-    Fully safe: no in-place ops on parameters or gradient-carrying tensors.
-    """
     def __init__(
         self, 
         world_size=1,
@@ -68,7 +64,7 @@ class SwAV_CLIP_Loss(nn.Module):
         self.image_tau = image_tau
         self.text_tau = text_tau
 
-        # SwAV
+        # swav
         self.num_prototypes = num_prototypes
         self.tau_p = tau_p
         self.lambda_swav = lambda_swav
@@ -78,18 +74,17 @@ class SwAV_CLIP_Loss(nn.Module):
         # init later when dim known
         self.prototypes = None
 
-    def _init_prototypes(self, dim, device):
+    def _init_prototypes(self, dim, device): 
+        # normal base prototypes
         p = torch.randn(self.num_prototypes, dim, device=device)
         p = F.normalize(p, dim=1)
         self.prototypes = nn.Parameter(p)
 
     def _safe_exp(self, x):
-        # avoid views that share underlying storage
         z = torch.exp(x).clamp(min=1e-8)
         return z.clone()
 
     def _sinkhorn(self, Q):
-        # expects Q already cloned
         with torch.no_grad():
             Q = Q / (Q.sum() + 1e-12)
             B, K = Q.shape
@@ -102,23 +97,21 @@ class SwAV_CLIP_Loss(nn.Module):
         return Q
 
     def forward(self, image_features, text_features, image_idx=None, text_idx=None):
-        # Distributed gather (matches CLIP_Loss behavior)
         if self.world_size > 1:
             image_features = torch.cat(GatherLayer.apply(image_features), dim=0)
             text_features = torch.cat(GatherLayer.apply(text_features), dim=0)
 
         device = image_features.device
 
-        # lazy init prototypes
+        # initialize prototypes lazily
         if self.prototypes is None:
             self._init_prototypes(image_features.size(1), device)
 
         img = F.normalize(image_features, dim=1)
         txt = F.normalize(text_features, dim=1)
 
-        # -----------------------------------------
-        # CLIP LOSS (same logic as original class)
-        # -----------------------------------------
+
+        # CLIP LOSS
         if self.personalized_tau:
             image_temp = self.image_tau[image_idx]
             text_temp  = self.text_tau[text_idx]
@@ -139,15 +132,13 @@ class SwAV_CLIP_Loss(nn.Module):
                 F.cross_entropy(sim.t(), labels)
             ) / 2.0
 
-        # -----------------------------------------
-        # SwAV LOSS
-        # -----------------------------------------
-        P = F.normalize(self.prototypes, dim=1)   # SAFE (not in-place)
+        # SWAV LOSS
+        P = F.normalize(self.prototypes, dim=1) # re-normalize
 
-        logits_img = img @ P.t()
+        logits_img = img @ P.t() # prototype space
         logits_txt = txt @ P.t()
 
-        if self.use_sinkhorn:
+        if self.use_sinkhorn: # prepare codes
             Q_img = self._safe_exp(logits_img / self.tau_p)
             Q_txt = self._safe_exp(logits_txt / self.tau_p)
 
@@ -158,24 +149,21 @@ class SwAV_CLIP_Loss(nn.Module):
             q_img = F.softmax(logits_img / self.tau_p, dim=1).detach()
             q_txt = F.softmax(logits_txt / self.tau_p, dim=1).detach()
 
-        p_img = F.log_softmax(logits_img / self.tau_p, dim=1)
+        p_img = F.log_softmax(logits_img / self.tau_p, dim=1) # prepare originals
         p_txt = F.log_softmax(logits_txt / self.tau_p, dim=1)
 
-        loss_img2txt = torch.mean(torch.sum(-q_txt * p_img, dim=1))
-        loss_txt2img = torch.mean(torch.sum(-q_img * p_txt, dim=1))
-        loss_swav = 0.5 * (loss_img2txt + loss_txt2img)
-
-        return loss_clip + self.lambda_swav * loss_swav
+        swav_loss = 0.5 * (
+            torch.mean(torch.sum(-q_txt * p_img, dim=1)) +
+            torch.mean(torch.sum(-q_img * p_txt, dim=1))
+        )
+        
+        return loss_clip + self.lambda_swav * swav_loss
 
 ###############################################################################
 
 ###############################################################################
 class SogCLR_SwAV_Loss(nn.Module):
-    """
-    Combined SogCLR (dynamic negative weighting) + SwAV (prototype clustering).
-    Matches EXACT forward signature required by CLIP model:
-        (loss, avg_image_tau, avg_text_tau)
-    """
+
     def __init__(
         self,
         N=2900000,
@@ -203,7 +191,6 @@ class SogCLR_SwAV_Loss(nn.Module):
         self.eps = 1e-8
         self.bsz = bsz
 
-        # per-sample memory (same as original SogCLR)
         self.s_I = torch.zeros(N).cuda()
         self.s_T = torch.zeros(N).cuda()
         self.b_I = torch.zeros(N).cuda()
@@ -213,17 +200,18 @@ class SogCLR_SwAV_Loss(nn.Module):
         self.c = surrogate_c
         self.mask_neg = (1.0 - torch.eye(bsz)).cuda()
 
-        # SwAV params
+        # swav params
         self.num_prototypes = num_prototypes
         self.tau_p = tau_p
         self.lambda_swav = lambda_swav
         self.use_sinkhorn = use_sinkhorn
         self.sinkhorn_iters = sinkhorn_iters
 
-        # prototypes (init lazily)
+        # prototypes
         self.prototypes = None
 
-    def _init_prototypes(self, dim, device):
+    def _init_prototypes(self, dim, device): 
+        # normal base prototypes
         P = torch.randn(self.num_prototypes, dim, device=device)
         P = F.normalize(P, dim=1)
         self.prototypes = nn.Parameter(P)
@@ -246,20 +234,17 @@ class SogCLR_SwAV_Loss(nn.Module):
 
 
     def forward(self, image_features, text_features, image_ids, text_ids, epoch):
-        # Multi-GPU gather
         if self.world_size > 1:
             image_features = torch.cat(GatherLayer.apply(image_features), dim=0)
             text_features = torch.cat(GatherLayer.apply(text_features), dim=0)
 
         device = image_features.device
 
-        # Initialize prototypes lazily
+        # initialize prototypes lazily
         if self.prototypes is None:
             self._init_prototypes(image_features.size(1), device)
-
-        # ------------------------------------------------
-        # 1. SOGCLR PART  (unchanged from original logic)
-        # ------------------------------------------------
+            
+        # SOGCLR LOSS
         sim = torch.einsum("id,jd->ij", image_features, text_features)
         diag_sim = torch.diagonal(sim)
         bsz = sim.size(0)
@@ -274,12 +259,12 @@ class SogCLR_SwAV_Loss(nn.Module):
         img_d = (image_diffs / self.temperature).clone().detach()
         txt_d = (text_diffs  / self.temperature).clone().detach()
 
-        # Update b_I
+        # update b_I
         old_bI = self.b_I[image_ids]
         new_bI = torch.max(img_d, old_bI[:, None].repeat(1, bsz))
         self.b_I[image_ids] = torch.max(new_bI, dim=1)[0]
 
-        # Update b_T
+        # update b_T
         old_bT = self.b_T[text_ids]
         new_bT = torch.max(txt_d, old_bT[None, :].repeat(bsz, 1))
         self.b_T[text_ids] = torch.max(new_bT, dim=0)[0]
@@ -310,15 +295,13 @@ class SogCLR_SwAV_Loss(nn.Module):
             torch.sum(weights_txt * text_diffs, dim=0).mean() / (bsz - 1)
         )
 
-        # ------------------------------------------------
-        # 2. SWAV PART  
-        # ------------------------------------------------
-        P = F.normalize(self.prototypes, dim=1)
+        #SWAV LOSS  
+        P = F.normalize(self.prototypes, dim=1) # re-normalize
 
-        logits_img = image_features @ P.t()
+        logits_img = image_features @ P.t() # prototype space
         logits_txt = text_features @ P.t()
 
-        if self.use_sinkhorn:
+        if self.use_sinkhorn: # prepare codes
             Q_img = self._safe_exp(logits_img / self.tau_p)
             Q_txt = self._safe_exp(logits_txt / self.tau_p)
 
@@ -329,7 +312,7 @@ class SogCLR_SwAV_Loss(nn.Module):
             q_img = F.softmax(logits_img / self.tau_p, dim=1).detach()
             q_txt = F.softmax(logits_txt / self.tau_p, dim=1).detach()
 
-        p_img = F.log_softmax(logits_img / self.tau_p, dim=1)
+        p_img = F.log_softmax(logits_img / self.tau_p, dim=1) # prepare original
         p_txt = F.log_softmax(logits_txt / self.tau_p, dim=1)
 
         swav_loss = 0.5 * (
@@ -337,10 +320,8 @@ class SogCLR_SwAV_Loss(nn.Module):
             torch.mean(torch.sum(-q_img * p_txt, dim=1))
         )
 
-        # Final combined loss
         loss = sogclr_loss + self.lambda_swav * swav_loss
-
-        # Return SAME format as SogCLR:
+        
         avg_image_tau = 0.0
         avg_text_tau  = 0.0
 
