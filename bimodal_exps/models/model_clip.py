@@ -5,7 +5,7 @@ from transformers import AutoModel, RobertaModel
 
 ##############################
 from models.losses import CLIP_Loss, CyCLIP_Loss, SogCLR_Loss, VICReg_Loss
-from models.losses import iSogCLR_New_v2_Loss, iSogCLR_New_v1_Loss, onlineCLR_Loss, iSogCLR_New_Loss, SwAV_CLIP_Loss
+from models.losses import iSogCLR_New_v2_Loss, iSogCLR_New_v1_Loss, onlineCLR_Loss, iSogCLR_New_Loss, SwAV_CLIP_Loss, SogCLR_SwAV_Loss
 ###############################
 
 import torch
@@ -38,6 +38,9 @@ class CLIP(nn.Module):
                  use_temp_net = True,
                  alpha = 1.0,
                  distributed=True,
+                 
+                 num_prototypes=300, 
+                 lambda_swav=0.4
                  ):
         super().__init__()
 
@@ -79,15 +82,19 @@ class CLIP(nn.Module):
 
         ################################
         elif self.ita_type == 'swav_clip':
-            # Build SwAV+CLIP loss. Pass personalized temp arrays if used.
-            if not personalized_tau:
-                self.criterion = SwAV_CLIP_Loss(world_size=world_size, temperature=self.temp,
-                                                personalized_tau=False, image_tau=None, text_tau=None,
-                                                num_prototypes=300, tau_p=0.1, lambda_swav=0.2, use_sinkhorn=True)
-            else:
-                self.criterion = SwAV_CLIP_Loss(world_size=world_size, temperature=self.temp,
-                                                personalized_tau=True, image_tau=self.image_temp, text_tau=self.text_temp,
-                                                num_prototypes=300, tau_p=0.1, lambda_swav=0.2, use_sinkhorn=True)
+            self.criterion = SwAV_CLIP_Loss(
+                world_size=world_size,
+                temperature=self.temp,
+                personalized_tau=personalized_tau,
+                image_tau=self.image_temp if personalized_tau else None,
+                text_tau=self.text_temp if personalized_tau else None,
+                
+                num_prototypes=num_prototypes,
+                tau_p=self.temp*10,#good for defualt temp
+                lambda_swav=lambda_swav,
+                use_sinkhorn=True,
+                sinkhorn_iters=3
+            )
         ###############################
 
         elif self.ita_type == 'cyclip':
@@ -104,6 +111,24 @@ class CLIP(nn.Module):
         # elif self.ita_type == 'sogclr_dro':
         #     self.criterion = SogCLR_DRO_Loss(world_size=world_size, gamma=sogclr_gamma, rho_init=rho_init, tau_init=tau_init, bsz=bsz,
         #                                      eta_init=eta_init, beta_u=beta_u, enable_surrogate=enable_surrogate)
+
+
+        #########################
+        elif self.ita_type == 'swav_sogclr':
+            self.criterion = SogCLR_SwAV_Loss(
+                world_size=world_size,
+                gamma=sogclr_gamma,
+                temperature=self.temp,
+                bsz=bsz,
+                
+                num_prototypes=num_prototypes,
+                tau_p=self.temp*2,
+                lambda_swav=lambda_swav,
+                use_sinkhorn=True,
+                sinkhorn_iters=3
+            )
+        ########################
+                     
         elif self.ita_type == 'isogclr_new_v2':
             self.criterion = iSogCLR_New_v2_Loss(world_size=world_size, gamma=sogclr_gamma, rho_init=rho_init, tau_init=tau_init, bsz=bsz,
                                                  eta_init=eta_init, beta_u=beta_u)
@@ -146,7 +171,7 @@ class CLIP(nn.Module):
 
         info_dict = {}
 
-        if self.ita_type in ['clip', 'cyclip']:
+        if self.ita_type in ['clip','cyclip','swav_clip']:#####################################
             if self.personalized_tau:
                 if self.distributed:
                     image_ids = concat_all_gather(idx)
@@ -166,29 +191,13 @@ class CLIP(nn.Module):
                 info_dict['avg_image_tau'] = avg_tau
                 info_dict['avg_text_tau'] = avg_tau
 
-        ################################
-        elif self.ita_type == 'swav_clip':
-            # Combined CLIP + SwAV loss (safe, no in-place ops in forward)
-            self.criterion = SwAV_CLIP_Loss(
-                world_size=world_size,
-                temperature=self.temp,
-                personalized_tau=personalized_tau,
-                image_tau=self.image_temp if personalized_tau else None,
-                text_tau=self.text_temp if personalized_tau else None,
-                num_prototypes=300,
-                tau_p=self.temp*10,
-                lambda_swav=0.4,
-                use_sinkhorn=True,
-                sinkhorn_iters=3
-            )
-        ###############################
 
         elif self.ita_type == 'vicreg':
             loss_ita = self.criterion(image_embeds, text_embeds)
             info_dict['avg_image_tau'] = 0.0
             info_dict['avg_text_tau'] = 0.0
 
-        elif self.ita_type == 'sogclr':
+        elif self.ita_type in ['sogclr','swav_sogclr']:################################################
             if self.distributed:
                 image_ids = concat_all_gather(idx)
                 text_ids = concat_all_gather(text_idx)
